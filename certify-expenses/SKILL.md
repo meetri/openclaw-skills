@@ -1,6 +1,6 @@
 ---
 name: certify-expenses
-description: Automate Certify/Emburse expense reports — login, create expenses, upload receipts to wallet, attach to expenses, and submit for approval. Use when the user asks about expense reports, reimbursement, Certify, or Emburse.
+description: Automate Certify/Emburse expense reports — upload receipts to wallet, create expenses from wallet items, adjust categories/amounts, and submit for approval. Use when the user asks about expense reports, reimbursement, Certify, or Emburse.
 ---
 
 # Certify/Emburse Expense Report Automation
@@ -8,10 +8,12 @@ description: Automate Certify/Emburse expense reports — login, create expenses
 Automates the full expense report lifecycle on Certify (Emburse) via headless Chrome + Playwright CDP:
 
 1. **Login** with MFA (SMS code)
-2. **Create expense report** with configurable line items
-3. **Upload receipts** (PDFs) to Certify Wallet
-4. **Attach receipts** from wallet to individual expenses
+2. **Upload receipts** (invoice PDFs) to the Certify Wallet
+3. **Create expenses from wallet items** — each receipt becomes an expense line
+4. **Adjust** categories, amounts, vendor, location ($120/mo limit enforced)
 5. **Submit report** for approval
+
+> **Key concept**: The Wallet is the starting point. Upload your invoices there first, then build expenses around them.
 
 ## Architecture
 
@@ -107,33 +109,43 @@ python3 scripts/certify_login.py
 
 **Agent must ask the human for the MFA code and write it to `~/expenses/certify/mfa_code.txt`.**
 
-### Phase 3: Create Expense Report
-
-```bash
-python3 scripts/certify_expenses.py create-report
-python3 scripts/certify_expenses.py create-report --months-back 3 --category "Travel"
-```
-
-Creates a new expense report and adds line items for each month. Default: $100 cellphone + $20 internet × N months = $120/month.
-
-**Monthly limit enforced**: Line items exceeding `monthly_limit` ($120 default) are skipped.
-
-### Phase 4: Upload Receipts to Wallet
+### Phase 3: Upload Receipts to Wallet
 
 ```bash
 python3 scripts/certify_expenses.py upload-receipts \
   --receipts /path/to/invoices/*.pdf
 ```
 
-Uploads PDFs to the Certify Wallet (AddReceipts.aspx). Receipts live in the wallet until attached to expenses.
+This uploads invoice PDFs to the Certify Wallet (`AddReceipts.aspx`). Receipts live in the wallet until you create expenses from them.
 
-### Phase 5: Attach Receipts to Expenses
+**This is the first real step** — get your invoices into the wallet before doing anything else.
+
+### Phase 4: Create Expenses from Wallet
 
 ```bash
-python3 scripts/certify_expenses.py attach-receipts --report-id <ID>
+python3 scripts/certify_expenses.py create-from-wallet
+python3 scripts/certify_expenses.py create-from-wallet --months-back 2
 ```
 
-Iterates through expense line items in the report, finds ones with "No Receipt", and attaches wallet receipts.
+This:
+1. Opens the wallet / expense report view
+2. For each receipt in the wallet, creates an expense line item
+3. Attaches the wallet receipt to its expense automatically
+4. Adjusts fields: **category**, **amount**, **vendor**, **location**
+5. Enforces the **monthly limit** ($120/mo default) — skips items that would exceed it
+
+The amounts and categories come from your config. Each wallet receipt gets matched to a line item definition based on the configured `line_items`.
+
+### Phase 5: Review & Adjust (Manual or Automated)
+
+```bash
+# Adjust a specific expense's amount/category if needed
+python3 scripts/certify_expenses.py adjust --report-id <ID>
+```
+
+After expenses are created from wallet items, review them. The script sets category/amount/vendor/location per config, but you can tweak manually in the Certify UI or re-run with different config values.
+
+**Important**: Total per month must not exceed `monthly_limit` ($120 default).
 
 ### Phase 6: Submit for Approval
 
@@ -152,7 +164,7 @@ python3 scripts/certify_expenses.py full \
   --confirm
 ```
 
-Runs create → upload → attach → submit in sequence.
+Runs: upload to wallet → create expenses from wallet → adjust → submit.
 
 ## Output
 
@@ -163,10 +175,13 @@ Runs create → upload → attach → submit in sequence.
 
 ## Critical Lessons (Hard-Won from Certify's ASP.NET UI)
 
-### 1. Category Select Triggers Postback
+### 1. Wallet First, Expenses Second
+The correct flow is: **upload receipts → create expenses from wallet items → adjust → submit**. Don't create blank expenses and try to attach receipts later — the wallet-first approach is how Certify is designed to work.
+
+### 2. Category Select Triggers Postback
 Selecting a category causes an ASP.NET postback that reloads parts of the form. **You MUST select category BEFORE filling the amount field.** If you fill amount first, the postback wipes it.
 
-### 2. Infragistics Amount Field
+### 3. Infragistics Amount Field
 The amount input is a WebNumericEditor (Infragistics). Standard `fill()` does NOT work. You must:
 ```python
 input.click()
@@ -176,36 +191,33 @@ page.keyboard.type("100.00")
 page.keyboard.press("Tab")  # Triggers validation
 ```
 
-### 3. Vendor Autocomplete
+### 4. Vendor Autocomplete
 The vendor field uses a custom autocomplete. Type the name, wait 2 seconds for the suggestion dropdown, then click the matching `div` in the suggestions list. If no suggestion appears, Tab out.
 
-### 4. Location Requires Force Click
+### 5. Location Requires Force Click
 The location field is sometimes obscured by other elements. Use `force=True` on the click.
 
-### 5. Receipt Upload — File Input Visibility
+### 6. Receipt Upload — File Input Visibility
 On AddReceipts.aspx, the file input (`MainContent_CertifyWalletSelect_FileUpload2`) may be hidden. Use `set_input_files()` which works on hidden inputs. The upload button may also be hidden after postback — force-show it via JS before clicking.
 
-### 6. ASP.NET Postbacks Are Everywhere
+### 7. ASP.NET Postbacks Are Everywhere
 Nearly every action triggers a `__doPostBack`. Always wait for `networkidle` after clicks. Don't assume form state persists across interactions.
 
-### 7. `customConfirm` Override
+### 8. `customConfirm` Override
 Certify uses `customConfirm()` instead of `window.confirm()` for delete/submit dialogs. Override both:
 ```javascript
 window.customConfirm = function() { return true; }
 window.confirm = function() { return true; }
 ```
 
-### 8. Disconnect, Don't Close
+### 9. Disconnect, Don't Close
 Always use `pw.stop()`, never `browser.close()` — closing kills the shared Chrome instance.
 
-### 9. Session Cookies
+### 10. Session Cookies
 Certify sessions can persist in the Chrome profile. Check if already logged in before running full login flow.
 
-### 10. Date Conventions
-Expense dates follow billing patterns:
-- Cellphone bills: 5th of the month
-- Internet bills: 17th of the month
-- Adjust in config `line_items` as needed
+### 11. $120/Month Limit
+Enforce the monthly cap in code. Two line items per month: cellphone ($100) + internet ($20) = $120. If a receipt would push the month over the limit, skip it or reduce the amount.
 
 ## Expense Pattern Reference
 
@@ -217,25 +229,30 @@ Default pattern (matches typical cellphone + internet reimbursement):
 | Internet | $20.00 | 17th | Cellphone & Internet |
 | **Monthly Total** | **$120.00** | | |
 
+Customize `line_items` in config for different patterns.
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | Amount field not found | Category postback not complete | Add longer delay after category select |
 | Vendor not saving | Autocomplete suggestion not clicked | Ensure suggestion div is clicked, not just typed |
-| "No Receipt Selected" warning | Receipt not attached from wallet | Upload to wallet first, then attach |
 | Upload button disappears | ASP.NET postback hid it | Force-show via JS evaluation |
 | Report won't submit | Missing required fields or receipts | Check all expenses have receipts and required fields |
 | Login redirect loop | Expired session | Re-run certify_login.py with MFA |
+| Monthly total > $120 | Too many items | Check config line_items; script enforces monthly_limit |
 
 ## Monthly Automation
 
 Recommended monthly workflow:
 
-1. Download AT&T invoices (use `att-invoices` skill)
+1. Download invoices (e.g. use `att-invoices` skill for AT&T bills)
 2. Run `certify_login.py` (requires human MFA code)
-3. Run `certify_expenses.py full --receipts ~/invoices/att/pdfs/ATTBill_*.pdf --months-back 1`
-4. Review in Certify UI
-5. Submit with `--confirm` (or submit manually)
+3. Run `certify_expenses.py full --receipts ~/invoices/*.pdf --months-back 1`
+   - Uploads receipts to wallet
+   - Creates expenses from wallet items
+   - Adjusts categories/amounts ($120/mo cap)
+   - Submits for approval (with `--confirm`)
+4. Review in Certify UI if needed
 
 The MFA requirement means this always needs human interaction for the verification code.
